@@ -66,6 +66,22 @@ const postShipment = async (storeId, apiKey, orderId, postBody) => {
     return response.json();
 };
 
+// Post multiple shipment details to OrderDesk API
+const postShipments = async (storeId, apiKey, shipments) => {
+    const response = await fetch(`https://app.orderdesk.me/api/v2/shipments`, {
+        method: "POST",
+        headers: {
+            "ORDERDESK-STORE-ID": storeId,
+            "ORDERDESK-API-KEY": apiKey,
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ shipments }) // Send shipments as an array
+    });
+
+    // Return the response JSON if successful, otherwise reject with the error response
+    return response.ok ? response.json() : Promise.reject(await response.json());
+};
+
 // Initialize Express app
 const app = express();
 app.use(bodyParser.json()); // Middleware to parse JSON request bodies
@@ -88,63 +104,78 @@ app.post('/', asyncHandler(async (req, res) => {
     const orders = Array.isArray(req.body) ? req.body : [req.body]; // Ensure orders is an array
     const results = [];
 
-    // Process orders one at a time sequentially
+    // Group shipments by store ID
+    const shipmentsByStore = {};
+
     for (const order of orders) {
-        const result = await processOrder(order); // Process the order
-        results.push(result); // Collect the result
-        if (result.error) {
-            // Stop processing further orders if an error occurs
-            return res.status(400).json({
-                message: 'Not OKAY',
-                results
-            });
+        const { tracking_number, shipment_date, order_number } = order;
+        const [storeId] = order_number.split('-'); // Extract store ID from order number
+
+        // Find the store by its ID
+        const store = findStore(storeId);
+        if (!store) {
+            results.push({ order, error: 'Invalid store ID' });
+            continue;
+        }
+
+        const { API_KEY: apiKey } = store;
+        if (!apiKey) {
+            results.push({ order, error: 'API key not found for the store' });
+            continue;
+        }
+
+        try {
+            // Fetch order details from OrderDesk
+            const orderData = await fetchOrder(storeId, apiKey, order_number);
+            const orderDetails = orderData.orders?.[0]; // Get the first order from the response
+            if (!orderDetails || !orderDetails.id) {
+                results.push({ order, error: 'Order not found or invalid' });
+                continue;
+            }
+
+            // Extract carrier code and shipment method from the shipping method
+            const [carrier_code, shipment_method] = (orderDetails.shipping_method || '').split(' ');
+            if (!carrier_code || !shipment_method) {
+                results.push({ order, error: 'Invalid shipping_method format' });
+                continue;
+            }
+
+            // Prepare the shipment payload
+            const shipment = {
+                order_id: orderDetails.id,
+                tracking_number,
+                carrier_code,
+                shipment_method,
+                shipment_date
+            };
+
+            // Group shipments by store ID
+            if (!shipmentsByStore[storeId]) {
+                shipmentsByStore[storeId] = { apiKey, shipments: [] };
+            }
+            shipmentsByStore[storeId].shipments.push(shipment);
+        } catch (error) {
+            results.push({ order, error: error.message || 'Unknown error' });
         }
     }
 
-    // If all orders are processed successfully
+    // Send shipments to OrderDesk grouped by store
+    for (const storeId in shipmentsByStore) {
+        const { apiKey, shipments } = shipmentsByStore[storeId];
+        try {
+            const postResponse = await postShipments(storeId, apiKey, shipments);
+            results.push({ storeId, postResponse });
+        } catch (error) {
+            results.push({ storeId, error: error.message || 'Failed to post shipments' });
+        }
+    }
+
+    // Respond with the results
     res.status(200).json({
         message: 'Orders processed',
         results
     });
 }));
-
-// Function to process a single order
-const processOrder = async (orderPayload) => {
-    const { tracking_number, shipment_date, order_number } = orderPayload;
-    const [storeId] = order_number.split('-'); // Extract store ID from order number
-    const sourceId = order_number;
-
-    // Find the store by its ID
-    const store = findStore(storeId);
-    if (!store) return { order: orderPayload, error: 'Invalid store ID' };
-
-    const { API_KEY: apiKey } = store;
-    if (!apiKey) return { order: orderPayload, error: 'API key not found for the store' };
-
-    try {
-        // Fetch order details from OrderDesk
-        const orderData = await fetchOrder(storeId, apiKey, sourceId);
-        const order = orderData.orders?.[0]; // Get the first order from the response
-        if (!order || !order.id) return { order: orderPayload, error: 'Order not found or invalid' };
-
-        // Extract carrier code and shipment method from the shipping method
-        const [carrier_code, shipment_method] = (order.shipping_method || '').split(' ');
-        if (!carrier_code || !shipment_method) {
-            return { order: orderPayload, error: 'Invalid shipping_method format' };
-        }
-
-        // Prepare the shipment payload
-        const postBody = { tracking_number, carrier_code, shipment_method, shipment_date };
-        // Post the shipment details to OrderDesk
-        const postResponse = await postShipment(storeId, apiKey, order.id, postBody);
-
-        // Return the processed order details
-        return { order: orderPayload, getResponse: orderData, postResponse };
-    } catch (error) {
-        // Handle errors during order processing
-        return { order: orderPayload, error: error.message || 'Unknown error' };
-    }
-};
 
 // Error-handling middleware for catching unhandled errors
 app.use((err, req, res, next) => {
