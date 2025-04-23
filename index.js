@@ -47,39 +47,37 @@ const fetchOrder = async (storeId, apiKey, sourceId) => {
             "Content-Type": "application/json"
         }
     });
-    // Return the response JSON if successful, otherwise reject with the error response
-    return response.ok ? response.json() : Promise.reject(await response.json());
-};
 
-// Post shipment details to OrderDesk API
-const postShipment = async (storeId, apiKey, orderId, postBody) => {
-    const response = await fetch(`https://app.orderdesk.me/api/v2/orders/${orderId}/shipments`, {
-        method: "POST",
-        headers: {
-            "ORDERDESK-STORE-ID": storeId,
-            "ORDERDESK-API-KEY": apiKey,
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(postBody)
-    });
-    // Return the response JSON
-    return response.json();
+    const responseData = await response.json();
+    console.log(`fetchOrder response for storeId ${storeId}, sourceId ${sourceId}:`, responseData);
+
+    if (response.ok && responseData.orders && responseData.orders.length > 0) {
+        const orderId = responseData.orders[0].id; // Extract the order ID
+        console.log(`Extracted order ID: ${orderId}`);
+        return orderId; // Return the extracted order ID
+    } else {
+        throw new Error(`Failed to fetch order details: ${responseData.message || 'Unknown error'}`);
+    }
 };
 
 // Post multiple shipment details to OrderDesk API
 const postShipments = async (storeId, apiKey, shipments) => {
-    const response = await fetch(`https://app.orderdesk.me/api/v2/shipments`, {
+    console.log("Sending shipments to OrderDesk batch-shipments endpoint:", { storeId, shipments });
+
+    const response = await fetch(`https://app.orderdesk.me/api/v2/batch-shipments`, {
         method: "POST",
         headers: {
             "ORDERDESK-STORE-ID": storeId,
             "ORDERDESK-API-KEY": apiKey,
             "Content-Type": "application/json"
         },
-        body: JSON.stringify({ shipments }) // Send shipments as an array
+        body: JSON.stringify(shipments) // Send shipments as an array
     });
 
-    // Return the response JSON if successful, otherwise reject with the error response
-    return response.ok ? response.json() : Promise.reject(await response.json());
+    const responseData = await response.json();
+    console.log("OrderDesk API response:", responseData);
+
+    return response.ok ? responseData : Promise.reject(responseData);
 };
 
 // Initialize Express app
@@ -101,61 +99,49 @@ const asyncHandler = (fn) => (req, res, next) => {
 
 // POST endpoint to process orders
 app.post('/', asyncHandler(async (req, res) => {
-    const orders = Array.isArray(req.body) ? req.body : [req.body]; // Ensure orders is an array
+    const shipments = Array.isArray(req.body) ? req.body : [req.body]; // Ensure shipments is an array
     const results = [];
 
     // Group shipments by store ID
     const shipmentsByStore = {};
 
-    for (const order of orders) {
-        const { tracking_number, shipment_date, order_number } = order;
-        const [storeId] = order_number.split('-'); // Extract store ID from order number
+    for (const shipment of shipments) {
+        const { source_id, tracking_number, carrier_code, shipment_method } = shipment;
+        const [storeId] = source_id.split('-'); // Extract store ID from order ID
 
         // Find the store by its ID
         const store = findStore(storeId);
         if (!store) {
-            results.push({ order, error: 'Invalid store ID' });
+            results.push({ shipment, error: 'Invalid store ID' });
             continue;
         }
 
         const { API_KEY: apiKey } = store;
         if (!apiKey) {
-            results.push({ order, error: 'API key not found for the store' });
+            results.push({ shipment, error: 'API key not found for the store' });
             continue;
         }
 
         try {
             // Fetch order details from OrderDesk
-            const orderData = await fetchOrder(storeId, apiKey, order_number);
-            const orderDetails = orderData.orders?.[0]; // Get the first order from the response
-            if (!orderDetails || !orderDetails.id) {
-                results.push({ order, error: 'Order not found or invalid' });
-                continue;
-            }
-
-            // Extract carrier code and shipment method from the shipping method
-            const [carrier_code, shipment_method] = (orderDetails.shipping_method || '').split(' ');
-            if (!carrier_code || !shipment_method) {
-                results.push({ order, error: 'Invalid shipping_method format' });
-                continue;
-            }
+            const orderId = await fetchOrder(storeId, apiKey, source_id);
+            console.log(`Fetched Order ID for source_id ${source_id}: ${orderId}`);
 
             // Prepare the shipment payload
-            const shipment = {
-                order_id: orderDetails.id,
+            const shipmentPayload = {
+                order_id: orderId, // Use the fetched order ID
                 tracking_number,
                 carrier_code,
-                shipment_method,
-                shipment_date
+                shipment_method
             };
 
             // Group shipments by store ID
             if (!shipmentsByStore[storeId]) {
                 shipmentsByStore[storeId] = { apiKey, shipments: [] };
             }
-            shipmentsByStore[storeId].shipments.push(shipment);
+            shipmentsByStore[storeId].shipments.push(shipmentPayload);
         } catch (error) {
-            results.push({ order, error: error.message || 'Unknown error' });
+            results.push({ shipment, error: error.message || 'Unknown error' });
         }
     }
 
@@ -172,7 +158,7 @@ app.post('/', asyncHandler(async (req, res) => {
 
     // Respond with the results
     res.status(200).json({
-        message: 'Orders processed',
+        message: 'Shipments processed',
         results
     });
 }));
@@ -184,7 +170,7 @@ app.use((err, req, res, next) => {
 });
 
 // Start the server on the specified port
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 4000;
 app.listen(port, () => {
     console.log(`Server running on port ${port}: http://localhost:${port}`);
 });
