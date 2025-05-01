@@ -32,6 +32,7 @@ let store_key = [
     { STORE_ID: "8729", API_KEY: process.env.STORE_8729 },
     { STORE_ID: "47257", API_KEY: process.env.STORE_47257 },
     { STORE_ID: "8636", API_KEY: process.env.STORE_8636 },
+    { STORE_ID: "118741", API_KEY: process.env.STORE_118741}
 ];
 
 // Helper function to find a store by its ID
@@ -112,13 +113,13 @@ app.post('/', asyncHandler(async (req, res) => {
         // Find the store by its ID
         const store = findStore(storeId);
         if (!store) {
-            results.push({ shipment, error: 'Invalid store ID' });
+            results.push({ shipment, error: `Invalid store ID: ${storeId}` });
             continue;
         }
 
         const { API_KEY: apiKey } = store;
         if (!apiKey) {
-            results.push({ shipment, error: 'API key not found for the store' });
+            results.push({ shipment, error: `API key not found for store ID: ${storeId}` });
             continue;
         }
 
