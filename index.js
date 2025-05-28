@@ -2,8 +2,13 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import 'dotenv/config';
 import fetch from 'node-fetch';
+import cluster from 'cluster';
+import os from 'os';
+import pLimit from 'p-limit';
 
-// Store keys with their corresponding API keys and store names
+//
+// Store configuration: Map store IDs to API keys and store names
+//
 let store_key = [
     { STORE_ID: "21633", API_KEY: process.env.STORE_21633, STORE_NAME: "Amentum Inventory" },
     { STORE_ID: "40348", API_KEY: process.env.STORE_40348, STORE_NAME: "Amentum Safety" },
@@ -32,146 +37,222 @@ let store_key = [
     { STORE_ID: "8729", API_KEY: process.env.STORE_8729, STORE_NAME: "SkillsUSA" },
     { STORE_ID: "47257", API_KEY: process.env.STORE_47257, STORE_NAME: "Springs Living" },
     { STORE_ID: "8636", API_KEY: process.env.STORE_8636, STORE_NAME: "TSA" },
-    { STORE_ID: "118741", API_KEY: process.env.STORE_118741, STORE_NAME: "Store AB" } // Placeholder for any unmatched store
+    { STORE_ID: "118741", API_KEY: process.env.STORE_118741, STORE_NAME: "Store AB" } // Placeholder for unmatched store
 ];
 
+//
 // Helper function to find a store by its ID
+//
 const findStore = (storeId) => store_key.find(store => store.STORE_ID === storeId);
 
-// Fetch order details from OrderDesk API
+//
+// Function: fetchOrder
+// Description: Fetches order details from the OrderDesk API using source_id
+// Logs the API response and errors in detail.
+// Throws an error if the order details are not retrievable.
+//
 const fetchOrder = async (storeId, apiKey, sourceId) => {
-    const response = await fetch(`https://app.orderdesk.me/api/v2/orders?source_id=${sourceId}`, {
-        method: "GET",
-        headers: {
-            "ORDERDESK-STORE-ID": storeId,
-            "ORDERDESK-API-KEY": apiKey,
-            "Content-Type": "application/json"
+    try {
+        const response = await fetch(`https://app.orderdesk.me/api/v2/orders?source_id=${sourceId}`, {
+            method: "GET",
+            headers: {
+                "ORDERDESK-STORE-ID": storeId,
+                "ORDERDESK-API-KEY": apiKey,
+                "Content-Type": "application/json"
+            }
+        });
+    
+        const responseData = await response.json();
+        console.log(`[fetchOrder] Response for storeId ${storeId}, sourceId ${sourceId}:`, responseData);
+    
+        if (response.ok && responseData.orders && responseData.orders.length > 0) {
+            const orderId = responseData.orders[0].id; // Extract the order ID
+            console.log(`[fetchOrder] Extracted order ID: ${orderId}`);
+            return orderId;
+        } else {
+            // Include full response data in error logging for troubleshooting
+            console.error(`[fetchOrder] Error: Failed to fetch order details for storeId ${storeId}, sourceId ${sourceId}`, responseData);
+            throw new Error(`Failed to fetch order details: ${responseData.message || 'Unknown error'}`);
         }
-    });
-
-    const responseData = await response.json();
-    console.log(`fetchOrder response for storeId ${storeId}, sourceId ${sourceId}:`, responseData);
-
-    if (response.ok && responseData.orders && responseData.orders.length > 0) {
-        const orderId = responseData.orders[0].id; // Extract the order ID
-        console.log(`Extracted order ID: ${orderId}`);
-        return orderId; // Return the extracted order ID
-    } else {
-        throw new Error(`Failed to fetch order details: ${responseData.message || 'Unknown error'}`);
+    } catch (err) {
+        console.error(`[fetchOrder] Exception caught for storeId ${storeId}, sourceId ${sourceId}:`, err);
+        throw err;
     }
 };
 
-// Post multiple shipment details to OrderDesk API
+//
+// Function: postShipments
+// Description: Posts multiple shipment details to the OrderDesk API in a batch.
+// Logs success and detailed error responses.
+// Returns the API response or rejects with an error.
+//
 const postShipments = async (storeId, apiKey, shipments) => {
-    console.log("Sending shipments to OrderDesk batch-shipments endpoint:", { storeId, shipments });
-
-    const response = await fetch(`https://app.orderdesk.me/api/v2/batch-shipments`, {
-        method: "POST",
-        headers: {
-            "ORDERDESK-STORE-ID": storeId,
-            "ORDERDESK-API-KEY": apiKey,
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(shipments) // Send shipments as an array
-    });
-
-    const responseData = await response.json();
-    console.log("OrderDesk API response:", responseData);
-
-    return response.ok ? responseData : Promise.reject(responseData);
+    try {
+        console.log(`[postShipments] Sending shipments for storeId ${storeId}:`, shipments);
+        const response = await fetch(`https://app.orderdesk.me/api/v2/batch-shipments`, {
+            method: "POST",
+            headers: {
+                "ORDERDESK-STORE-ID": storeId,
+                "ORDERDESK-API-KEY": apiKey,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(shipments)
+        });
+    
+        const responseData = await response.json();
+        console.log(`[postShipments] OrderDesk API response for storeId ${storeId}:`, responseData);
+    
+        if (response.ok) {
+            return responseData;
+        } else {
+            console.error(`[postShipments] Error response for storeId ${storeId}:`, responseData);
+            return Promise.reject(responseData);
+        }
+    } catch (err) {
+        console.error(`[postShipments] Exception caught for storeId ${storeId}:`, err);
+        throw err;
+    }
 };
 
-// Initialize Express app
+//
+// Express app and Middleware setup
+//
 const app = express();
-app.use(bodyParser.json()); // Middleware to parse JSON request bodies
 
-// Middleware to validate request payloads
+// Use bodyParser to parse incoming JSON payloads
+app.use(bodyParser.json());
+
+// Validate incoming request payloads
 app.use((req, res, next) => {
     if (!req.body || (!Array.isArray(req.body) && typeof req.body !== 'object')) {
+        console.error('[Payload Validation] Invalid request payload:', req.body);
         return res.status(400).json({ message: 'Invalid request payload' });
     }
     next();
 });
 
-// Wrapper for handling async errors in route handlers
+// Wrapper for async route handlers to catch errors and pass them to error-handling middleware
 const asyncHandler = (fn) => (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
 };
 
-// POST endpoint to process orders
+//
+// POST Endpoint: Process orders and shipments
+// Description: Processes incoming shipment(s), groups them by store, and sends batch shipment updates.
+// Logs each step for clarity and troubleshooting. Uses a concurrency limiter to process shipment items.
+// This approach helps avoiding overloading the server when hundreds of requests happen in rapid succession.
+//
 app.post('/', asyncHandler(async (req, res) => {
+    console.log('[POST /] Received request:', req.body);
     const shipments = Array.isArray(req.body) ? req.body : [req.body]; // Ensure shipments is an array
-    const results = [];
 
-    // Group shipments by store ID
+    // Concurrency limiter to restrict simultaneous external API calls.
+    // Adjust the concurrency value (e.g., 10) as needed.
+    const limit = pLimit(10);
+
+    // Temporary storage for results and grouped shipments
+    const results = [];
     const shipmentsByStore = {};
 
-    for (const shipment of shipments) {
+    // Process each shipment concurrently with the limiter.
+    await Promise.all(shipments.map(shipment => limit(async () => {
         const { source_id, tracking_number, carrier_code, shipment_method } = shipment;
         const [storeId] = source_id.split('-'); // Extract store ID from order ID
-
+        
         // Find the store by its ID
         const store = findStore(storeId);
         if (!store) {
-            results.push({ shipment, error: `Invalid store ID: ${storeId}` });
-            continue;
+            const errMsg = `Invalid store ID: ${storeId}`;
+            console.error(`[POST /] ${errMsg}`, shipment);
+            results.push({ shipment, error: errMsg });
+            return;
         }
-
+    
         const { API_KEY: apiKey } = store;
         if (!apiKey) {
-            results.push({ shipment, error: `API key not found for store ID: ${storeId}` });
-            continue;
+            const errMsg = `API key not found for store ID: ${storeId}`;
+            console.error(`[POST /] ${errMsg}`, shipment);
+            results.push({ shipment, error: errMsg });
+            return;
         }
-
+    
         try {
-            // Fetch order details from OrderDesk
+            // Fetch order details using OrderDesk API
             const orderId = await fetchOrder(storeId, apiKey, source_id);
-            console.log(`Fetched Order ID for source_id ${source_id}: ${orderId}`);
-
-            // Prepare the shipment payload
+            console.log(`[POST /] Fetched Order ID for source_id ${source_id}: ${orderId}`);
+    
+            // Build the shipment payload for the batch API
             const shipmentPayload = {
-                order_id: orderId, // Use the fetched order ID
+                order_id: orderId,
                 tracking_number,
                 carrier_code,
                 shipment_method
             };
-
-            // Group shipments by store ID
+    
+            // Group shipments by store ID for batch processing
             if (!shipmentsByStore[storeId]) {
                 shipmentsByStore[storeId] = { apiKey, shipments: [] };
             }
             shipmentsByStore[storeId].shipments.push(shipmentPayload);
         } catch (error) {
+            console.error(`[POST /] Error processing shipment with source_id ${source_id}:`, error);
             results.push({ shipment, error: error.message || 'Unknown error' });
         }
-    }
+    })));
 
-    // Send shipments to OrderDesk grouped by store
+    console.log(`[POST /] Completed processing individual shipments. Grouped shipments:`, shipmentsByStore);
+    
+    // Process posting grouped shipments for each store.
     for (const storeId in shipmentsByStore) {
         const { apiKey, shipments } = shipmentsByStore[storeId];
         try {
             const postResponse = await postShipments(storeId, apiKey, shipments);
+            console.log(`[POST /] Successfully posted shipments for storeId ${storeId}`);
             results.push({ storeId, postResponse });
         } catch (error) {
+            console.error(`[POST /] Failed to post shipments for storeId ${storeId}:`, error);
             results.push({ storeId, error: error.message || 'Failed to post shipments' });
         }
     }
-
-    // Respond with the results
+    
+    // Final response with detailed results
+    console.log('[POST /] Final results:', results);
     res.status(200).json({
         message: 'Shipments processed',
         results
     });
 }));
 
-// Error-handling middleware for catching unhandled errors
+//
+// Global Error Handling Middleware
+// Logs full error stack and responds with a standardized error message.
+//
 app.use((err, req, res, next) => {
-    console.error(err.stack); // Log the error stack trace
+    console.error('[Global Error Handling] Error encountered:', err.stack);
     res.status(500).json({ message: 'Internal Server Error', error: err.message });
 });
 
-// Start the server on the specified port
-const port = process.env.PORT || 4000;
-app.listen(port, () => {
-    console.log(`Server running on port ${port}: http://localhost:${port}`);
-});
+//
+// Clustering Setup to Utilize Available CPU Cores
+//
+if (cluster.isMaster) {
+    const numCPUs = os.cpus().length;
+    console.log(`[Cluster] Master ${process.pid} is running. Forking ${numCPUs} workers.`);
+    
+    // Fork worker processes
+    for (let i = 0; i < numCPUs; i++) {
+        cluster.fork();
+    }
+    
+    // Listen for dying workers and replace them
+    cluster.on('exit', (worker, code, signal) => {
+        console.error(`[Cluster] Worker ${worker.process.pid} died (code: ${code}, signal: ${signal}). Restarting...`);
+        cluster.fork();
+    });
+} else {
+    // Start the server for worker processes
+    const port = process.env.PORT || 4000;
+    app.listen(port, () => {
+        console.log(`[Server] Worker ${process.pid} running on port ${port}. Access at http://localhost:${port}`);
+    });
+}
