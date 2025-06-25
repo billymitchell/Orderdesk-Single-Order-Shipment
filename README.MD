@@ -5,16 +5,17 @@ This project is an API designed to process shipping orders for multiple stores u
 ## Features
 
 - Processes shipping orders for multiple stores.
+- Queues incoming shipments in memory and processes them in the background.
 - Fetches order details from the OrderDesk API.
-- Posts shipment details to the OrderDesk API.
+- Posts shipment details to the OrderDesk API in batches per store.
 - Validates request payloads for correctness.
 - Handles errors gracefully with middleware.
-- Processes one order at a time sequentially.
+- Responds immediately to API requests while processing shipments asynchronously.
 
 ## Project Structure
 
 - **index.js**:  
-  The main entry point of the application. It initializes the Express server, sets up middleware, and defines the API routes.
+  The main entry point of the application. It initializes the Express server, sets up middleware, and defines the API routes and background queue processor.
 
 - **.env**:  
   Stores environment variables such as API keys for each store (e.g., `STORE_21633`, `STORE_40348`, etc.) and the server port.
@@ -25,11 +26,23 @@ This project is an API designed to process shipping orders for multiple stores u
   - `node-fetch`: Used for making HTTP requests to the OrderDesk API.
   - `dotenv`: Loads environment variables from a `.env` file.
   - `body-parser`: Middleware for parsing JSON request bodies.
+  - `p-limit`: Controls concurrency for background processing.
+
+## How It Works
+
+1. **API receives shipment data** via POST `/` (single object or array).
+2. **Shipments are added to an in-memory queue**. The API immediately responds with a `202 Accepted` status and a message indicating the shipments are queued for processing.
+3. **A background process runs every 5 seconds** to process the queue:
+   - Shipments are grouped by store.
+   - For each shipment, the app fetches order details from OrderDesk.
+   - Shipments are posted in batches to OrderDesk per store.
+   - Results and errors are logged to the console (not returned to the original API caller).
+4. **Errors in processing** are logged, but do not affect the API response to the client.
 
 ## API Endpoints
 
 ### POST `/`
-Processes shipping orders for one or more stores.
+Queues shipping orders for one or more stores for background processing.
 
 #### Request Body
 The request body should be a JSON object or an array of objects with the following fields:
@@ -47,39 +60,20 @@ The request body should be a JSON object or an array of objects with the followi
 ```
 
 #### Example Response
-- **Success (200)**:
+- **Accepted (202)**:
   ```json
   {
-    "message": "Orders processed",
-    "results": [
-      {
-        "order": {
-          "tracking_number": "123456789",
-          "shipment_date": "2025-04-21",
-          "order_number": "21633-001"
-        },
-        "getResponse": { /* Order details fetched from OrderDesk */ },
-        "postResponse": { /* Shipment details posted to OrderDesk */ }
-      }
-    ]
+    "message": "Shipments queued for processing"
   }
   ```
 - **Error (400)**:
   ```json
   {
-    "message": "Not OKAY",
-    "results": [
-      {
-        "order": {
-          "tracking_number": "123456789",
-          "shipment_date": "2025-04-21",
-          "order_number": "21633-001"
-        },
-        "error": "Invalid store ID"
-      }
-    ]
+    "message": "Invalid request payload"
   }
   ```
+
+> **Note:** The API does not return the result of shipment processing in the response. Processing happens asynchronously in the background. Check server logs for processing results and errors.
 
 ## Setup & Installation
 
@@ -117,11 +111,14 @@ The request body should be a JSON object or an array of objects with the followi
 - [node-fetch](https://www.npmjs.com/package/node-fetch): For making HTTP requests.
 - [dotenv](https://www.npmjs.com/package/dotenv): For managing environment variables.
 - [body-parser](https://www.npmjs.com/package/body-parser): Middleware for parsing JSON request bodies.
+- [p-limit](https://www.npmjs.com/package/p-limit): Controls concurrency for background processing.
 
 ## Notes
 
 - Ensure that all required environment variables are set in the `.env` file before starting the server.
-- The API processes one order at a time sequentially. If an error occurs while processing an order, subsequent orders will not be processed.
+- The API queues shipments and processes them asynchronously. The response only confirms queuing, not processing.
+- Processing results and errors are logged to the server console.
+- The in-memory queue is volatile: if the server restarts, queued shipments are lost.
 
 ## License
 
