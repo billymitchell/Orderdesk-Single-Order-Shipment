@@ -1,155 +1,222 @@
 # Orderdesk Shipping API
 
-This project is an API designed to process shipping orders for multiple stores using [Express](https://expressjs.com). It securely manages store-specific API keys through environment variables and integrates with the [OrderDesk API](https://orderdesk.com/) to fetch order details and post shipment information.
+This API accepts shipment notifications, looks up orders in Order Desk, and posts shipment updates, all while respecting Order Desk’s per-store rate limits. It’s built with [Express](https://expressjs.com), uses [Bottleneck](https://www.npmjs.com/package/bottleneck) for rate limiting, and [p-limit](https://www.npmjs.com/package/p-limit) for controlled concurrency.
 
-## Features
+## At a glance
 
-- Processes shipping orders for multiple stores.
-- Queues incoming shipments in memory and processes them in the background.
-- Fetches order details from the OrderDesk API.
-- Posts shipment details to the OrderDesk API in batches per store.
-- Respects Order Desk API rate limits with per-store token-bucket limiting and automatic retries on 429.
-- Validates request payloads for correctness.
-- Handles errors gracefully with middleware.
-- Responds immediately to API requests while processing shipments asynchronously.
+- Accepts POSTs with shipments (single or array)
+- Queues shipments in memory and processes in the background
+- For each shipment: fetch order (by source_id) → build payload → batch-post per store
+- Per-store rate limiter mirrors Order Desk limits and handles 429 retry logic
+- Returns 202 immediately; processing continues asynchronously
 
-## Project Structure
+## Project structure
 
-- **index.js**:  
-  The main entry point of the application. It initializes the Express server, sets up middleware, and defines the API routes and background queue processor.
+- `index.js` — server, queue, rate limiting, Order Desk requests
+- `.env` — environment variables (store API keys, PORT, logs)
+- `package.json` — dependencies and scripts
 
-- **.env**:  
-  Stores environment variables such as API keys for each store (e.g., `STORE_21633`, `STORE_40348`, etc.) and the server port.
+## End-to-end flow (verbose)
 
-- **package.json**:  
-  Defines project metadata and dependencies, including:
-  - `express`: Web framework for building the API.
-  - `node-fetch`: Used for making HTTP requests to the OrderDesk API.
-  - `dotenv`: Loads environment variables from a `.env` file.
-  - `body-parser`: Middleware for parsing JSON request bodies.
-  - `p-limit`: Controls concurrency for background processing.
+1) Ingest
+- Endpoint: POST `/`
+- Payload: single shipment object or an array of shipment objects
+- The request is validated to be an object or array (basic shape check). If invalid, returns 400.
+- On success, the shipments are appended to an in-memory queue and the API responds `202 Accepted` immediately.
 
-## How It Works
+2) Background processor (every 5 seconds)
+- Takes a snapshot of the queue (empties the queue immediately for processing) and works on that copy.
+- Uses `p-limit(10)` to cap parallel work when fetching orders across all shipments.
+- For each shipment (in parallel, up to 10 at a time):
+  - Extract storeId from `source_id` by splitting on `-` (prefix must be the numeric store ID, e.g., `21633-...`).
+  - Look up the store in a static table and read its API key from environment variables.
+  - Call Order Desk GET `/api/v2/orders?source_id=...` to resolve the Order Desk `order_id`.
+  - Prepare a minimal shipment payload: `{ order_id, tracking_number, carrier_code, shipment_method }`.
+  - Group payloads by store to batch submit later.
 
-1. **API receives shipment data** via POST `/` (single object or array).
-2. **Shipments are added to an in-memory queue**. The API immediately responds with a `202 Accepted` status and a message indicating the shipments are queued for processing.
-3. **A background process runs every 5 seconds** to process the queue:
-   - Shipments are grouped by store.
-   - For each shipment, the app fetches order details from OrderDesk.
-   - Shipments are posted in batches to OrderDesk per store.
-   - Results and errors are logged to the console (not returned to the original API caller).
-4. **Errors in processing** are logged, but do not affect the API response to the client.
+3) Batch submissions (after lookups)
+- For each store that has one or more shipment payloads, submit a single POST to `/api/v2/batch-shipments` with that store’s batch.
+- In the current implementation, these per-store batch posts run one store at a time (sequential loop). This keeps logs simpler; it can be parallelized in the future if needed.
 
-### Order Desk Rate Limits (New)
+4) Logging and results
+- Processing results (successes or errors per shipment or per store) are logged to the server console.
+- The original HTTP caller does not receive these details (as processing is asynchronous).
 
-Order Desk recently introduced rate limits. This app follows their guidance:
+## Request schema (accurate to code)
 
-- Leaky bucket per store: initial 20 tokens, refills at 3 requests/second (≈100 requests per rolling 30s)
-- We read the response headers:
-  - `X-Tokens-Remaining` (or `X-Tokens-Available`): remaining tokens
-  - `X-Retry-After`: seconds to pause when burst protection kicks in
-- Behavior on 429 Too Many Requests:
-  - We pause the affected store's requests for `X-Retry-After` seconds (with slight jitter) and retry with backoff
-  - Max 5 retry attempts per request (configurable)
-- GET requests do not send `Content-Type` headers per Order Desk docs.
+Each shipment object supports the following fields used by the system:
 
-Implementation details:
+- `source_id` (string, required): Must start with the store ID followed by a dash, e.g., `21633-ORD-000001`. The prefix before the dash is used to select the store and API key.
+- `tracking_number` (string, required): Tracking number.
+- `carrier_code` (string, required): Carrier identifier that Order Desk recognizes (e.g., `ups`, `fedex`, `usps`).
+- `shipment_method` (string, required): Human-friendly method name (e.g., `Ground`, `2Day`).
 
-- Centralized `odFetch` wrapper handles headers, per-store Bottleneck limiter, and 429/backoff
-- The limiter settings are: reservoir=20, reservoirIncreaseAmount=3, reservoirIncreaseInterval=1000ms, reservoirIncreaseMaximum=20, maxConcurrent=3
+Example (single object):
 
-Reference: https://apidocs.orderdesk.com/#rate-limits
-
-Environment flags for logging:
-
-- `RATE_LIMIT_LOG`: one of `off`, `warn` (default), or `verbose`
-  - `warn`: warns when tokens fall below threshold and logs 429 blocks as errors
-  - `verbose`: logs token counts after each request
-  - `off`: disables rate-limit token logs (still logs 429 errors)
-- `RATE_LIMIT_WARN_TOKENS`: integer threshold (default 5) at or below which a warning is emitted
-
-## API Endpoints
-
-### POST `/`
-Queues shipping orders for one or more stores for background processing.
-
-#### Request Body
-The request body should be a JSON object or an array of objects with the following fields:
-- `tracking_number` (string): The tracking number for the shipment.
-- `shipment_date` (string): The shipment date in ISO 8601 format (e.g., `YYYY-MM-DD`).
-- `order_number` (string): The order number, which includes the store ID as a prefix (e.g., `21633-001`).
-
-#### Example Request
 ```json
 {
-  "tracking_number": "123456789",
-  "shipment_date": "2025-04-21",
-  "order_number": "21633-001"
+  "source_id": "21633-ORD-000001",
+  "tracking_number": "1Z999AA10123456784",
+  "carrier_code": "ups",
+  "shipment_method": "Ground"
 }
 ```
 
-#### Example Response
-- **Accepted (202)**:
-  ```json
+Example (array):
+
+```json
+[
   {
-    "message": "Shipments queued for processing"
-  }
-  ```
-- **Error (400)**:
-  ```json
+    "source_id": "21633-ORD-000001",
+    "tracking_number": "1Z999AA10123456784",
+    "carrier_code": "ups",
+    "shipment_method": "Ground"
+  },
   {
-    "message": "Invalid request payload"
+    "source_id": "21633-ORD-000002",
+    "tracking_number": "1Z999AA10123456785",
+    "carrier_code": "ups",
+    "shipment_method": "Ground"
   }
+]
+```
+
+Response examples:
+
+- 202 Accepted
+  ```json
+  { "message": "Shipments queued for processing" }
+  ```
+- 400 Bad Request
+  ```json
+  { "message": "Invalid request payload" }
   ```
 
-> **Note:** The API does not return the result of shipment processing in the response. Processing happens asynchronously in the background. Check server logs for processing results and errors.
+## Rate limiting (deep dive)
 
-## Setup & Installation
+Order Desk limits are modeled per store with a token-bucket/leaky-bucket using Bottleneck. Settings per store:
 
-1. **Clone the Repository:**  
-   ```sh
-   git clone <repository-url>
-   cd Orderdesk
-   ```
+- `reservoir: 20` — initial burst capacity
+- `reservoirIncreaseAmount: 3` — refill amount per interval
+- `reservoirIncreaseInterval: 1000` ms — refill every second
+- `reservoirIncreaseMaximum: 20` — cap burst bucket at 20
+- `maxConcurrent: 3` — at most 3 in-flight requests per store
 
-2. **Install Dependencies:**  
-   Run the following command to install dependencies:
-   ```sh
-   npm install
-   ```
+Behavior:
 
-3. **Set Up Environment Variables:**  
-   Create a `.env` file in the root directory and add the following variables:
-   ```env
-   PORT=3000
-   STORE_21633=<API_KEY_FOR_STORE_21633>
-   STORE_40348=<API_KEY_FOR_STORE_40348>
-   # Add API keys for other stores as needed
-   ```
+- All outbound calls to Order Desk run through a centralized helper `odFetch(...)` which schedules them on the per-store limiter.
+- After each response, the code reads `X-Tokens-Remaining` (or `X-Tokens-Available`) and logs warnings if tokens are low.
+- If Order Desk returns `429 Too Many Requests`, the code reads `X-Retry-After`, waits that many seconds (plus small jitter), and retries. It will retry up to `maxRetries` (default 5). If the header is missing, it uses a safe default delay (~2s + jitter).
+- Non-429 errors (e.g., transient network issues) also retry with exponential backoff (up to `maxRetries`).
 
-4. **Start the Server:**  
-   Run the following command to start the server:
-   ```sh
-   npm start
-   ```
-   The server will run on `http://localhost:3000` by default.
+What slows down when limits are hit?
+
+- Only the affected store’s outbound requests slow down. Other stores continue at their own pace because each store has its own limiter instance.
+- The API itself does not return 429 to clients; throttling happens internally during background processing.
+
+References: Order Desk API docs — https://apidocs.orderdesk.com/#rate-limits
+
+## Concurrency model (deep dive)
+
+- Global parallelism during lookups: `p-limit(10)` caps how many shipments are resolving their order IDs at once across all stores.
+- Per-store concurrency: at most `3` in-flight requests per store (`maxConcurrent: 3`).
+- Batch submissions: a single POST per store after lookups; currently executed sequentially across stores in a `for ... in` loop.
+
+Throughput intuition (rule of thumb):
+
+- For one store, steady-state is ~3 requests/second after the initial 20-token burst. The drain time for `R` requests is approximately `(max(R - 20, 0)) / 3` seconds, plus network latency and any 429 backoff. Example: 101 requests → about `(101 − 20) / 3 ≈ 27s` plus latency.
+
+## Error handling and retries
+
+- Input validation: rejects non-object/non-array bodies with HTTP 400.
+- Per-shipment processing errors (e.g., bad store ID, missing API key, fetch failure) are caught and logged; other shipments proceed.
+- `odFetch` handles:
+  - 429s: honor `X-Retry-After`, jitter, bounded retries
+  - other errors: exponential backoff with jitter, bounded retries
+- If retries are exhausted, the error is logged and surfaced in the processing results; the system continues with other work.
+
+## Logging and observability
+
+Key log markers:
+
+- `[processQueue]` — lifecycle of queue processing, grouping, and batch posts
+- `[fetchOrder]` — order lookup requests and responses
+- `[postShipments]` — batch submission requests and responses
+- `[RateLimit]` / `[RateLimit Warning]` — token levels and warnings
+- `[RateLimit OVERAGE]` — 429 events and enforced wait periods
+
+Tunable via environment variables:
+
+- `RATE_LIMIT_LOG`: `off` | `warn` (default) | `verbose`
+- `RATE_LIMIT_WARN_TOKENS`: integer threshold (default `5`) for low-token warnings
+
+## Configuration
+
+Environment variables (examples):
+
+```env
+PORT=4000
+RATE_LIMIT_LOG=warn
+RATE_LIMIT_WARN_TOKENS=5
+
+# One environment variable per store, referenced in code by store ID
+STORE_21633=xxxxxxxx
+STORE_40348=xxxxxxxx
+# ...add others as needed
+```
+
+The mapping of `storeId → API key env var` is defined in `index.js` via a static array. Ensure any store you use in `source_id` has a corresponding entry and environment variable.
+
+## Operational notes
+
+- The in-memory queue is volatile. If the process restarts, queued (unprocessed) shipments are lost.
+- Consider external persistence (Redis, DB) if you need durability and visibility of queue state.
+- If you need higher throughput across many stores, options include:
+  - Increasing global parallelism (`p-limit`) cautiously
+  - Adjusting per-store `maxConcurrent` (mind API server tolerance)
+  - Parallelizing per-store batch POSTs
+  - Horizontal scaling (multiple instances) with a shared durable queue and a global limiter strategy
+
+## Setup & run
+
+1) Install dependencies
+
+```sh
+npm install
+```
+
+2) Configure `.env` (see Configuration section)
+
+3) Start the server
+
+```sh
+npm start
+```
+
+Default port is `4000` unless overridden by `PORT`.
+
+## Example usage
+
+Send a batch of shipments for a single store (to observe rate limiting behavior):
+
+```json
+[
+  { "source_id": "21633-ORD-000001", "tracking_number": "1Z999AA10123456784", "carrier_code": "ups", "shipment_method": "Ground" },
+  { "source_id": "21633-ORD-000002", "tracking_number": "1Z999AA10123456785", "carrier_code": "ups", "shipment_method": "Ground" }
+]
+```
+
+With many items (e.g., 50–100) for the same store, you’ll see token warnings and possibly 429-based pauses; other stores continue normally.
 
 ## Dependencies
 
-- [Express](https://expressjs.com): Web framework for building the API.
-- [node-fetch](https://www.npmjs.com/package/node-fetch): For making HTTP requests.
-- [dotenv](https://www.npmjs.com/package/dotenv): For managing environment variables.
-- [body-parser](https://www.npmjs.com/package/body-parser): Middleware for parsing JSON request bodies.
-- [p-limit](https://www.npmjs.com/package/p-limit): Controls concurrency for background processing.
-- [Bottleneck](https://www.npmjs.com/package/bottleneck): Token bucket rate limiter used to comply with Order Desk limits.
-
-## Notes
-
-- Ensure that all required environment variables are set in the `.env` file before starting the server.
-- The API queues shipments and processes them asynchronously. The response only confirms queuing, not processing.
-- Processing results and errors are logged to the server console.
-- The in-memory queue is volatile: if the server restarts, queued shipments are lost.
+- [Express](https://expressjs.com)
+- [node-fetch](https://www.npmjs.com/package/node-fetch)
+- [dotenv](https://www.npmjs.com/package/dotenv)
+- [body-parser](https://www.npmjs.com/package/body-parser)
+- [p-limit](https://www.npmjs.com/package/p-limit)
+- [Bottleneck](https://www.npmjs.com/package/bottleneck)
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+MIT
