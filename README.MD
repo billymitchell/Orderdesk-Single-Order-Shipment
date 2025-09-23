@@ -8,6 +8,7 @@ This project is an API designed to process shipping orders for multiple stores u
 - Queues incoming shipments in memory and processes them in the background.
 - Fetches order details from the OrderDesk API.
 - Posts shipment details to the OrderDesk API in batches per store.
+- Respects Order Desk API rate limits with per-store token-bucket limiting and automatic retries on 429.
 - Validates request payloads for correctness.
 - Handles errors gracefully with middleware.
 - Responds immediately to API requests while processing shipments asynchronously.
@@ -38,6 +39,34 @@ This project is an API designed to process shipping orders for multiple stores u
    - Shipments are posted in batches to OrderDesk per store.
    - Results and errors are logged to the console (not returned to the original API caller).
 4. **Errors in processing** are logged, but do not affect the API response to the client.
+
+### Order Desk Rate Limits (New)
+
+Order Desk recently introduced rate limits. This app follows their guidance:
+
+- Leaky bucket per store: initial 20 tokens, refills at 3 requests/second (≈100 requests per rolling 30s)
+- We read the response headers:
+  - `X-Tokens-Remaining` (or `X-Tokens-Available`): remaining tokens
+  - `X-Retry-After`: seconds to pause when burst protection kicks in
+- Behavior on 429 Too Many Requests:
+  - We pause the affected store's requests for `X-Retry-After` seconds (with slight jitter) and retry with backoff
+  - Max 5 retry attempts per request (configurable)
+- GET requests do not send `Content-Type` headers per Order Desk docs.
+
+Implementation details:
+
+- Centralized `odFetch` wrapper handles headers, per-store Bottleneck limiter, and 429/backoff
+- The limiter settings are: reservoir=20, reservoirIncreaseAmount=3, reservoirIncreaseInterval=1000ms, reservoirIncreaseMaximum=20, maxConcurrent=3
+
+Reference: https://apidocs.orderdesk.com/#rate-limits
+
+Environment flags for logging:
+
+- `RATE_LIMIT_LOG`: one of `off`, `warn` (default), or `verbose`
+  - `warn`: warns when tokens fall below threshold and logs 429 blocks as errors
+  - `verbose`: logs token counts after each request
+  - `off`: disables rate-limit token logs (still logs 429 errors)
+- `RATE_LIMIT_WARN_TOKENS`: integer threshold (default 5) at or below which a warning is emitted
 
 ## API Endpoints
 
@@ -112,6 +141,7 @@ The request body should be a JSON object or an array of objects with the followi
 - [dotenv](https://www.npmjs.com/package/dotenv): For managing environment variables.
 - [body-parser](https://www.npmjs.com/package/body-parser): Middleware for parsing JSON request bodies.
 - [p-limit](https://www.npmjs.com/package/p-limit): Controls concurrency for background processing.
+- [Bottleneck](https://www.npmjs.com/package/bottleneck): Token bucket rate limiter used to comply with Order Desk limits.
 
 ## Notes
 

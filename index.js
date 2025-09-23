@@ -6,6 +6,7 @@ import bodyParser from 'body-parser';
 import 'dotenv/config';
 import fetch from 'node-fetch';
 import pLimit from 'p-limit';
+import Bottleneck from 'bottleneck';
 
 const store_key = [
     { STORE_ID: "21633", API_KEY: process.env.STORE_21633, STORE_NAME: "Amentum Inventory" },
@@ -49,20 +50,125 @@ const findStore = (storeId) => {
     return store;
 };
 
+///////////////////////////////////////////////////////////////////////////////
+// SECTION 1b: Order Desk Fetch with Rate Limiting & Retry
+///////////////////////////////////////////////////////////////////////////////
+
+// Per-store limiters following Order Desk docs (leaky bucket):
+// - Initial bucket size: 20
+// - Refill: +3 tokens per second
+// - Burst protection via 429 + X-Retry-After
+const storeLimiters = new Map();
+
+const getStoreLimiter = (storeId) => {
+    if (!storeLimiters.has(storeId)) {
+        const limiter = new Bottleneck({
+            reservoir: 20, // initial tokens
+            reservoirIncreaseAmount: 3,
+            reservoirIncreaseInterval: 1000, // ms
+            reservoirIncreaseMaximum: 20, // cap burst bucket at 20
+            maxConcurrent: 3 // keep a small concurrency per store
+        });
+        storeLimiters.set(storeId, limiter);
+    }
+    return storeLimiters.get(storeId);
+};
+
+// Utility delay
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Configurable logging flags
+const RATE_LIMIT_WARN_TOKENS = Number.isFinite(parseInt(process.env.RATE_LIMIT_WARN_TOKENS, 10))
+    ? parseInt(process.env.RATE_LIMIT_WARN_TOKENS, 10)
+    : 5;
+// off | warn | verbose
+const RATE_LIMIT_LOG = (process.env.RATE_LIMIT_LOG || 'warn').toLowerCase();
+
+/**
+ * Centralized fetch wrapper for Order Desk with per-store rate limiting,
+ * 429 handling (X-Retry-After), and header normalization.
+ */
+const odFetch = async ({ storeId, apiKey, url, method = 'GET', body, extraHeaders = {}, maxRetries = 5 }) => {
+    const limiter = getStoreLimiter(storeId);
+
+    const makeRequest = async () => {
+        const headers = {
+            'ORDERDESK-STORE-ID': storeId,
+            'ORDERDESK-API-KEY': apiKey,
+            // Only send Content-Type when there is a body (non-GET per docs)
+            ...(body ? { 'Content-Type': 'application/json' } : {}),
+            ...extraHeaders
+        };
+
+        const res = await fetch(url, {
+            method,
+            headers,
+            body: body ? JSON.stringify(body) : undefined
+        });
+
+        const tokensHeader = res.headers.get('x-tokens-remaining') ?? res.headers.get('x-tokens-available');
+        if (tokensHeader !== null && tokensHeader !== undefined) {
+            const tokensRemaining = parseInt(tokensHeader, 10);
+            const info = `${method} ${url}`;
+            if (RATE_LIMIT_LOG === 'verbose') {
+                console.info(`[RateLimit] store=${storeId} tokens=${tokensHeader} after ${info}`);
+            }
+            if (Number.isFinite(tokensRemaining)) {
+                if (tokensRemaining <= 0) {
+                    console.error(`[RateLimit OVERAGE] store=${storeId} tokens=0 at ${info}`);
+                } else if (RATE_LIMIT_LOG !== 'off' && tokensRemaining <= RATE_LIMIT_WARN_TOKENS) {
+                    console.warn(`[RateLimit Warning] store=${storeId} tokens=${tokensRemaining} (<= ${RATE_LIMIT_WARN_TOKENS}) at ${info}`);
+                }
+            }
+        }
+
+        return res;
+    };
+
+    let attempt = 0;
+    while (true) {
+        try {
+            const response = await limiter.schedule(() => makeRequest());
+
+            if (response.status !== 429) {
+                return response;
+            }
+
+            // 429 handling
+            const retryAfterHeader = response.headers.get('x-retry-after');
+            const seconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN;
+            const baseDelayMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 2000; // default 2s
+            attempt += 1;
+            if (attempt > maxRetries) {
+                const text = await response.text().catch(() => '');
+                throw new Error(`429 Too Many Requests after ${maxRetries} retries. Last body: ${text}`);
+            }
+            const jitter = Math.floor(Math.random() * 300);
+            const delay = baseDelayMs + jitter;
+            console.error(`[RateLimit OVERAGE] 429 block: store=${storeId} retry_after=${retryAfterHeader ?? 'n/a'}s attempt=${attempt}/${maxRetries} waiting_ms=${delay} method=${method} url=${url}`);
+            await sleep(delay);
+            continue;
+        } catch (err) {
+            // Network or other errors: retry with backoff up to maxRetries
+            attempt += 1;
+            if (attempt > maxRetries) {
+                throw err;
+            }
+            const delay = Math.min(30000, 1000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 250);
+            console.warn(`[odFetch] Error attempt ${attempt}/${maxRetries} for store ${storeId}: ${err.message}. Retrying in ${delay}ms`);
+            await sleep(delay);
+        }
+    }
+};
+
 /**
  * Fetch order details from OrderDesk using source ID.
  * Logs detailed responses and errors.
  */
 const fetchOrder = async (storeId, apiKey, sourceId) => {
     try {
-        const response = await fetch(`https://app.orderdesk.me/api/v2/orders?source_id=${sourceId}`, {
-            method: "GET",
-            headers: {
-                "ORDERDESK-STORE-ID": storeId,
-                "ORDERDESK-API-KEY": apiKey,
-                "Content-Type": "application/json"
-            }
-        });
+        const url = `https://app.orderdesk.me/api/v2/orders?source_id=${encodeURIComponent(sourceId)}`;
+        const response = await odFetch({ storeId, apiKey, url, method: 'GET' });
         const responseData = await response.json();
         console.info(`[fetchOrder] Response for storeId ${storeId}, sourceId ${sourceId}:`, responseData);
         if (response.ok && responseData.orders && responseData.orders.length > 0) {
@@ -86,15 +192,8 @@ const fetchOrder = async (storeId, apiKey, sourceId) => {
 const postShipments = async (storeId, apiKey, shipments) => {
     try {
         console.info(`[postShipments] Sending shipments for storeId ${storeId}:`, shipments);
-        const response = await fetch(`https://app.orderdesk.me/api/v2/batch-shipments`, {
-            method: "POST",
-            headers: {
-                "ORDERDESK-STORE-ID": storeId,
-                "ORDERDESK-API-KEY": apiKey,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify(shipments)
-        });
+        const url = `https://app.orderdesk.me/api/v2/batch-shipments`;
+        const response = await odFetch({ storeId, apiKey, url, method: 'POST', body: shipments });
         const responseData = await response.json();
         console.info(`[postShipments] API response for storeId ${storeId}:`, responseData);
         if (response.ok) {
