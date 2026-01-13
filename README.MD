@@ -50,6 +50,9 @@ Each shipment object supports the following fields used by the system:
 - `tracking_number` (string, required): Tracking number.
 - `carrier_code` (string, required): Carrier identifier that Order Desk recognizes (e.g., `ups`, `fedex`, `usps`).
 - `shipment_method` (string, required): Human-friendly method name (e.g., `Ground`, `2Day`).
+- `order_items` (array, optional): When present with at least one item, the API uses Order Desk's single create shipment endpoint.
+- `order_id` (string|number, optional): If provided with `order_items`, skips the source_id lookup.
+- `store_id` (string|number, optional): If provided, used to select the store when `source_id` is not present.
 
 Example (single object):
 
@@ -79,6 +82,37 @@ Example (array):
     "shipment_method": "Ground"
   }
 ]
+```
+
+Example (single create-shipment with order items):
+
+```json
+{
+  "source_id": "21633-ORD-000003",
+  "tracking_number": "1Z2398479234",
+  "carrier_code": "UPS",
+  "shipment_method": "Ground",
+  "order_items": [
+    { "code": "SKU1", "quantity": 1 },
+    { "code": "SKU2", "quantity": 1 }
+  ]
+}
+```
+
+Example (single create-shipment with explicit order_id and store_id):
+
+```json
+{
+  "store_id": "21633",
+  "order_id": "123456789",
+  "tracking_number": "1Z2398479234",
+  "carrier_code": "UPS",
+  "shipment_method": "Ground",
+  "order_items": [
+    { "code": "SKU1", "quantity": 1 },
+    { "code": "SKU2", "quantity": 1 }
+  ]
+}
 ```
 
 Response examples:

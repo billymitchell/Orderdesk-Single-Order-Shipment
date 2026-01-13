@@ -208,6 +208,42 @@ const postShipments = async (storeId, apiKey, shipments) => {
     }
 };
 
+/**
+ * Post a single shipment to OrderDesk.
+ * Returns API response or rejects if error.
+ */
+const postSingleShipment = async (storeId, apiKey, shipment) => {
+    try {
+        console.info(`[postSingleShipment] Sending shipment for storeId ${storeId}:`, shipment);
+        const url = `https://app.orderdesk.me/api/v2/orders/${encodeURIComponent(shipment.order_id)}/shipments`;
+        const response = await odFetch({ storeId, apiKey, url, method: 'POST', body: shipment });
+        const responseData = await response.json();
+        console.info(`[postSingleShipment] API response for storeId ${storeId}:`, responseData);
+        if (response.ok) {
+            return responseData;
+        } else {
+            console.error(`[postSingleShipment] Error response for storeId ${storeId}:`, responseData);
+            return Promise.reject(responseData);
+        }
+    } catch (err) {
+        console.error(`[postSingleShipment] Exception for storeId ${storeId}:`, err);
+        throw err;
+    }
+};
+
+/**
+ * Resolve the store ID from a shipment payload.
+ */
+const resolveStoreId = (shipment) => {
+    if (shipment.store_id !== undefined && shipment.store_id !== null) {
+        return String(shipment.store_id);
+    }
+    if (shipment.source_id) {
+        return shipment.source_id.split('-')[0];
+    }
+    return null;
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // SECTION 2: In-Memory Queue & Background Processing
 ///////////////////////////////////////////////////////////////////////////////
@@ -238,11 +274,12 @@ const processQueue = async () => {
     const shipmentsByStore = {};
     
     await Promise.all(queuedShipments.map(shipment => limit(async () => {
-        const { source_id, tracking_number, carrier_code, shipment_method } = shipment;
-        const [storeId] = source_id.split('-');
+        const { source_id, tracking_number, carrier_code, shipment_method, order_items, order_id } = shipment;
+        const storeId = resolveStoreId(shipment);
+        const isSingleShipment = Array.isArray(order_items) && order_items.length > 0;
         const store = findStore(storeId);
-        if (!store) {
-            const errMsg = `Invalid store ID: ${storeId}`;
+        if (!storeId || !store) {
+            const errMsg = `Invalid store ID: ${storeId ?? 'missing'}`;
             console.error(`[processQueue] ${errMsg}`, shipment);
             results.push({ shipment, error: errMsg });
             return;
@@ -255,14 +292,44 @@ const processQueue = async () => {
             return;
         }
         try {
-            // Retrieve order details.
-            const orderId = await fetchOrder(storeId, apiKey, source_id);
-            console.info(`[processQueue] Fetched Order ID for source_id ${source_id}: ${orderId}`);
-            const shipmentPayload = { order_id: orderId, tracking_number, carrier_code, shipment_method };
-            if (!shipmentsByStore[storeId]) {
-                shipmentsByStore[storeId] = { apiKey, shipments: [] };
+            if (isSingleShipment) {
+                let resolvedOrderId = order_id;
+                if (!resolvedOrderId) {
+                    if (!source_id) {
+                        const errMsg = 'Missing source_id or order_id for single shipment payload';
+                        console.error(`[processQueue] ${errMsg}`, shipment);
+                        results.push({ shipment, error: errMsg });
+                        return;
+                    }
+                    resolvedOrderId = await fetchOrder(storeId, apiKey, source_id);
+                    console.info(`[processQueue] Fetched Order ID for source_id ${source_id}: ${resolvedOrderId}`);
+                }
+                const shipmentPayload = {
+                    order_id: resolvedOrderId,
+                    tracking_number,
+                    carrier_code,
+                    shipment_method,
+                    order_items
+                };
+                const postResponse = await postSingleShipment(storeId, apiKey, shipmentPayload);
+                console.info(`[processQueue] Successfully posted single shipment for storeId ${storeId}`);
+                results.push({ storeId, postResponse });
+            } else {
+                if (!source_id) {
+                    const errMsg = 'Missing source_id for batch shipment payload';
+                    console.error(`[processQueue] ${errMsg}`, shipment);
+                    results.push({ shipment, error: errMsg });
+                    return;
+                }
+                // Retrieve order details.
+                const resolvedOrderId = await fetchOrder(storeId, apiKey, source_id);
+                console.info(`[processQueue] Fetched Order ID for source_id ${source_id}: ${resolvedOrderId}`);
+                const shipmentPayload = { order_id: resolvedOrderId, tracking_number, carrier_code, shipment_method };
+                if (!shipmentsByStore[storeId]) {
+                    shipmentsByStore[storeId] = { apiKey, shipments: [] };
+                }
+                shipmentsByStore[storeId].shipments.push(shipmentPayload);
             }
-            shipmentsByStore[storeId].shipments.push(shipmentPayload);
         } catch (error) {
             console.error(`[processQueue] Error processing shipment with source_id ${source_id}:`, error);
             results.push({ shipment, error: error.message || 'Unknown error' });
