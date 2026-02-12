@@ -1,0 +1,16 @@
+{
+    "source_id": "21633-ORD-000003",
+    "tracking_number": "1Z2398479234",
+    "carrier_code": "UPS",
+    "shipment_method": "Ground",
+    "order_items": [
+        {
+            "code": "SKU1",
+            "quantity": 1
+        },
+        {
+            "code": "SKU2",
+            "quantity": 1
+        }
+    ]
+}

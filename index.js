@@ -84,6 +84,37 @@ const RATE_LIMIT_WARN_TOKENS = Number.isFinite(parseInt(process.env.RATE_LIMIT_W
 // off | warn | verbose
 const RATE_LIMIT_LOG = (process.env.RATE_LIMIT_LOG || 'warn').toLowerCase();
 
+// Allowed carrier codes for incoming shipment payloads.
+// Can be overridden with ALLOWED_CARRIER_CODES="ups,fedex,usps,..."
+const DEFAULT_ALLOWED_CARRIER_CODES = [
+    'ups',
+    'fedex',
+    'usps',
+    'dhl',
+    'ontrac',
+    'lasership',
+    'canadapost',
+    'australiapost',
+    'royalmail',
+    'gls',
+    'amazon',
+    'other'
+];
+
+const allowedCarrierCodes = new Set(
+    (process.env.ALLOWED_CARRIER_CODES || DEFAULT_ALLOWED_CARRIER_CODES.join(','))
+        .split(',')
+        .map(code => code.trim().toLowerCase())
+        .filter(Boolean)
+);
+
+const maskApiKey = (value) => {
+    if (!value) return 'missing';
+    const str = String(value);
+    if (str.length <= 8) return '***';
+    return `${str.slice(0, 4)}...${str.slice(-4)}`;
+};
+
 /**
  * Centralized fetch wrapper for Order Desk with per-store rate limiting,
  * 429 handling (X-Retry-After), and header normalization.
@@ -100,10 +131,47 @@ const odFetch = async ({ storeId, apiKey, url, method = 'GET', body, extraHeader
             ...extraHeaders
         };
 
+        const requestLogHeaders = {
+            ...headers,
+            'ORDERDESK-API-KEY': maskApiKey(headers['ORDERDESK-API-KEY'])
+        };
+        console.info('[odFetch][request]', {
+            storeId,
+            method,
+            url,
+            headers: requestLogHeaders,
+            body: body ?? null
+        });
+
         const res = await fetch(url, {
             method,
             headers,
             body: body ? JSON.stringify(body) : undefined
+        });
+
+        const responsePreviewText = await res.clone().text().catch(() => '');
+        let responsePreview;
+        if (!responsePreviewText) {
+            responsePreview = null;
+        } else {
+            try {
+                responsePreview = JSON.parse(responsePreviewText);
+            } catch {
+                responsePreview = responsePreviewText;
+            }
+        }
+        console.info('[odFetch][response]', {
+            storeId,
+            method,
+            url,
+            status: res.status,
+            ok: res.ok,
+            headers: {
+                'x-tokens-remaining': res.headers.get('x-tokens-remaining'),
+                'x-tokens-available': res.headers.get('x-tokens-available'),
+                'x-retry-after': res.headers.get('x-retry-after')
+            },
+            body: responsePreview
         });
 
         const tokensHeader = res.headers.get('x-tokens-remaining') ?? res.headers.get('x-tokens-available');
@@ -378,6 +446,31 @@ const asyncHandler = (fn) => (req, res, next) => {
 app.post('/', asyncHandler(async (req, res) => {
     console.info('[POST /] Received:', req.body);
     const shipments = Array.isArray(req.body) ? req.body : [req.body];
+
+    const invalidCarrierEntries = shipments
+        .map((shipment, index) => {
+            const rawCarrierCode = shipment?.carrier_code;
+            const normalizedCarrierCode = typeof rawCarrierCode === 'string'
+                ? rawCarrierCode.trim().toLowerCase()
+                : '';
+            const isValid = normalizedCarrierCode && allowedCarrierCodes.has(normalizedCarrierCode);
+            if (isValid) return null;
+            return {
+                index,
+                source_id: shipment?.source_id ?? null,
+                carrier_code: rawCarrierCode ?? null
+            };
+        })
+        .filter(Boolean);
+
+    if (invalidCarrierEntries.length > 0) {
+        console.error('[POST /] Unrecognized carrier code(s):', invalidCarrierEntries);
+        return res.status(400).json({
+            message: 'Unrecognized carrier code',
+            errors: invalidCarrierEntries
+        });
+    }
+
     addShipmentsToQueue(shipments);
     console.info(`[POST /] Shipments queued. Total in queue: ${shipmentsQueue.length}`);
     res.status(202).json({ message: 'Shipments queued for processing' });
