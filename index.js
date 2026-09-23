@@ -83,6 +83,13 @@ const RATE_LIMIT_WARN_TOKENS = Number.isFinite(parseInt(process.env.RATE_LIMIT_W
     : 5;
 // off | warn | verbose
 const RATE_LIMIT_LOG = (process.env.RATE_LIMIT_LOG || 'warn').toLowerCase();
+const ORDERDESK_REQUEST_TIMEOUT_MS = Number.isFinite(parseInt(process.env.ORDERDESK_REQUEST_TIMEOUT_MS, 10))
+    ? parseInt(process.env.ORDERDESK_REQUEST_TIMEOUT_MS, 10)
+    : 30000;
+const ORDERDESK_BATCH_SIZE = Number.isFinite(parseInt(process.env.ORDERDESK_BATCH_SIZE, 10))
+    ? Math.max(1, parseInt(process.env.ORDERDESK_BATCH_SIZE, 10))
+    : 100;
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
 
 // Allowed carrier codes for incoming shipment payloads.
 // Can be overridden with ALLOWED_CARRIER_CODES="ups,fedex,usps,..."
@@ -143,11 +150,19 @@ const odFetch = async ({ storeId, apiKey, url, method = 'GET', body, extraHeader
             body: body ?? null
         });
 
-        const res = await fetch(url, {
-            method,
-            headers,
-            body: body ? JSON.stringify(body) : undefined
-        });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), ORDERDESK_REQUEST_TIMEOUT_MS);
+        let res;
+        try {
+            res = await fetch(url, {
+                method,
+                headers,
+                body: body ? JSON.stringify(body) : undefined,
+                signal: controller.signal
+            });
+        } finally {
+            clearTimeout(timeout);
+        }
 
         const responsePreviewText = await res.clone().text().catch(() => '');
         let responsePreview;
@@ -198,22 +213,23 @@ const odFetch = async ({ storeId, apiKey, url, method = 'GET', body, extraHeader
         try {
             const response = await limiter.schedule(() => makeRequest());
 
-            if (response.status !== 429) {
+            if (response.status !== 429 && !RETRYABLE_HTTP_STATUSES.has(response.status)) {
                 return response;
             }
 
-            // 429 handling
+            // Retry rate-limit and transient server responses.
             const retryAfterHeader = response.headers.get('x-retry-after');
             const seconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN;
-            const baseDelayMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 2000; // default 2s
+            const baseDelayMs = Number.isFinite(seconds) && seconds > 0
+                ? seconds * 1000
+                : Math.min(30000, 1000 * Math.pow(2, attempt + 1));
             attempt += 1;
             if (attempt > maxRetries) {
-                const text = await response.text().catch(() => '');
-                throw new Error(`429 Too Many Requests after ${maxRetries} retries. Last body: ${text}`);
+                return response;
             }
             const jitter = Math.floor(Math.random() * 300);
             const delay = baseDelayMs + jitter;
-            console.error(`[RateLimit OVERAGE] 429 block: store=${storeId} retry_after=${retryAfterHeader ?? 'n/a'}s attempt=${attempt}/${maxRetries} waiting_ms=${delay} method=${method} url=${url}`);
+            console.warn(`[odFetch] Retryable HTTP ${response.status}: store=${storeId} retry_after=${retryAfterHeader ?? 'n/a'}s attempt=${attempt}/${maxRetries} waiting_ms=${delay} method=${method} url=${url}`);
             await sleep(delay);
             continue;
         } catch (err) {
@@ -265,7 +281,28 @@ const postShipments = async (storeId, apiKey, shipments) => {
         const responseData = await response.json();
         console.info(`[postShipments] API response for storeId ${storeId}:`, responseData);
         if (response.ok) {
-            return responseData;
+            const itemResults = Array.isArray(responseData.results) ? responseData.results : [];
+            const failures = shipments
+                .map((shipment, index) => ({
+                    index,
+                    shipment,
+                    result: itemResults[index] ?? {
+                        status: 'error',
+                        message: 'Order Desk did not return a result for this shipment'
+                    }
+                }))
+                .filter(({ result }) => result?.status !== 'success');
+
+            if (failures.length > 0) {
+                console.error(`[postShipments] ${failures.length}/${shipments.length} shipment(s) failed inside a successful HTTP response for storeId ${storeId}:`, failures);
+            }
+
+            return {
+                response: responseData,
+                submittedCount: shipments.length,
+                successCount: shipments.length - failures.length,
+                failures
+            };
         } else {
             console.error(`[postShipments] Error response for storeId ${storeId}:`, responseData);
             return Promise.reject(responseData);
@@ -318,6 +355,7 @@ const resolveStoreId = (shipment) => {
 
 // In-memory queue for shipments (volatile).
 let shipmentsQueue = [];
+let isProcessingQueue = false;
 
 /**
  * Add shipments to the in-memory queue.
@@ -333,10 +371,22 @@ const addShipmentsToQueue = (shipments) => {
  * - Groups shipments by store and posts in batches.
  */
 const processQueue = async () => {
-    if (shipmentsQueue.length === 0) return;
+    if (isProcessingQueue || shipmentsQueue.length === 0) return;
+
+    isProcessingQueue = true;
+    try {
+        // Drain anything added while this run is active before releasing the lock.
+        while (shipmentsQueue.length > 0) {
+            await processQueueSnapshot(shipmentsQueue.splice(0));
+        }
+    } finally {
+        isProcessingQueue = false;
+    }
+};
+
+const processQueueSnapshot = async (queuedShipments) => {
     
     console.info('[processQueue] Shipments found in queue. Processing...');
-    const queuedShipments = shipmentsQueue.splice(0); // Clear queue snapshot.
     const limit = pLimit(10);
     const results = [];
     const shipmentsByStore = {};
@@ -407,20 +457,30 @@ const processQueue = async () => {
     // Batch post shipments grouped by store.
     for (const storeId in shipmentsByStore) {
         const { apiKey, shipments } = shipmentsByStore[storeId];
-        try {
-            const postResponse = await postShipments(storeId, apiKey, shipments);
-            console.info(`[processQueue] Successfully posted shipments for storeId ${storeId}`);
-            results.push({ storeId, postResponse });
-        } catch (error) {
-            console.error(`[processQueue] Failed to post shipments for storeId ${storeId}:`, error);
-            results.push({ storeId, error: error.message || 'Failed to post shipments' });
+        for (let offset = 0; offset < shipments.length; offset += ORDERDESK_BATCH_SIZE) {
+            const shipmentBatch = shipments.slice(offset, offset + ORDERDESK_BATCH_SIZE);
+            try {
+                const postResponse = await postShipments(storeId, apiKey, shipmentBatch);
+                if (postResponse.failures.length === 0) {
+                    console.info(`[processQueue] Successfully posted ${shipmentBatch.length} shipments for storeId ${storeId}`);
+                }
+                results.push({ storeId, offset, ...postResponse });
+            } catch (error) {
+                console.error(`[processQueue] Failed to post shipment batch for storeId ${storeId} at offset ${offset}:`, error);
+                results.push({ storeId, offset, shipments: shipmentBatch, error: error.message || 'Failed to post shipments' });
+            }
         }
     }
     console.info('[processQueue] Completed processing with results:', results);
 };
 
-// Run the background processor every 5 seconds.
-setInterval(processQueue, 5000);
+// Run the background processor every 5 seconds without allowing rejected
+// promises to become unhandled process-level errors.
+setInterval(() => {
+    processQueue().catch((error) => {
+        console.error('[processQueue] Unexpected queue processor failure:', error);
+    });
+}, 5000);
 
 ///////////////////////////////////////////////////////////////////////////////
 // SECTION 3: Express Server Setup
