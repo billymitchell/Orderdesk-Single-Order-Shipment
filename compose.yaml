@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: orderdesk_shipping
+      POSTGRES_USER: orderdesk
+      POSTGRES_PASSWORD: orderdesk-local-only
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderdesk -d orderdesk_shipping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - orderdesk_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  orderdesk_postgres_data:
+

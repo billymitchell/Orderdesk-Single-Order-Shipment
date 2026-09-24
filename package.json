@@ -1,24 +1,29 @@
 {
-  "name": "all-vendors-items",
+  "name": "orderdesk-shipping-api",
   "version": "1.0.0",
   "main": "index.js",
   "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "heroku:configure": "node scripts/heroku-configure.js",
+    "heroku:verify": "node scripts/heroku-verify.js",
+    "migrate": "node scripts/migrate.js",
+    "test": "node --test",
     "start": "node index.js"
   },
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Durable shipment ingestion and delivery service for Order Desk",
+  "private": true,
   "dependencies": {
     "body-parser": "^1.20.3",
-    "csv-parser": "^3.2.0",
+    "bottleneck": "^2.19.5",
     "dotenv": "^16.4.5",
-    "env": "^0.0.2",
     "express": "^4.20.0",
-    "multer": "^1.4.5-lts.1",
     "node-fetch": "^3.3.2",
     "p-limit": "^6.2.0",
-    "bottleneck": "^2.19.5"
+    "pg": "^8.23.0"
   }
 }

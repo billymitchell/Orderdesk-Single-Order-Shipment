@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.DS_Store
+node_modules
+npm-debug.log*
+test
+*.json
+!package.json
+!package-lock.json
+
