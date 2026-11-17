@@ -16,7 +16,7 @@ export const retryDelayMs = (attemptCount) => {
 
 const shipmentFields = (payload) => ({
     tracking_number: payload.tracking_number,
-    carrier_code: payload.carrier_code,
+    carrier_code: payload.carrier_code?.toUpperCase() === 'UPS' ? 'UPS' : payload.carrier_code,
     shipment_method: payload.shipment_method,
     ...(payload.weight !== undefined ? { weight: payload.weight } : {}),
     ...(payload.cost !== undefined ? { cost: payload.cost } : {}),
