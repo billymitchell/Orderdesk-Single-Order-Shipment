@@ -17,7 +17,8 @@ import {
 const help = `Usage: npm run heroku:configure -- --app YOUR_APP_NAME [--yes]
 
 Checks the target app and Postgres add-on, loads STORE_* credentials from .env,
-generates missing inbound/admin keys, and uploads only approved config vars.
+generates missing inbound/admin keys and the dashboard session key, and uploads
+only approved config vars (plus SUPABASE_URL / SUPABASE_ANON_KEY when set).
 Secret values are never printed. Use --yes to skip typing the app name.`;
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -96,8 +97,23 @@ const main = async () => {
         throw new Error('INBOUND_API_KEY and ADMIN_API_KEY must each contain at least 32 characters.');
     }
 
-    await writeLocalSecrets(local.text, { INBOUND_API_KEY: inboundApiKey, ADMIN_API_KEY: adminApiKey });
-    console.info('Saved inbound and administrator keys to the ignored local .env file.');
+    // Encrypts the request-log dashboard's stored Supabase tokens.
+    const authSessionKey = /^[0-9a-fA-F]{64}$/.test(local.values.AUTH_SESSION_KEY || '')
+        ? local.values.AUTH_SESSION_KEY
+        : generateSecret();
+    const dashboard = Object.fromEntries(['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'ALLOWED_EMAIL_DOMAIN', 'LOG_RETENTION_DAYS']
+        .filter((name) => !isPlaceholder(local.values[name]))
+        .map((name) => [name, local.values[name]]));
+
+    await writeLocalSecrets(local.text, {
+        INBOUND_API_KEY: inboundApiKey,
+        ADMIN_API_KEY: adminApiKey,
+        AUTH_SESSION_KEY: authSessionKey
+    });
+    console.info('Saved inbound, administrator, and dashboard session keys to the ignored local .env file.');
+    if (!dashboard.SUPABASE_URL || !dashboard.SUPABASE_ANON_KEY) {
+        console.warn('SUPABASE_URL / SUPABASE_ANON_KEY are not in .env; /admin will show "not configured" until they are set.');
+    }
 
     const assignments = [
         'NODE_ENV=production',
@@ -106,6 +122,8 @@ const main = async () => {
         'DATABASE_SSL_REJECT_UNAUTHORIZED=false',
         `INBOUND_API_KEY=${inboundApiKey}`,
         `ADMIN_API_KEY=${adminApiKey}`,
+        `AUTH_SESSION_KEY=${authSessionKey}`,
+        ...Object.entries(dashboard).map(([name, value]) => `${name}=${value}`),
         ...Object.entries(stores.values).map(([name, value]) => `${name}=${value}`)
     ];
     runHeroku(['config:set', ...assignments, '--app', appName], { hideFailureOutput: true });

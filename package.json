@@ -11,19 +11,24 @@
     "heroku:verify": "node scripts/heroku-verify.js",
     "migrate": "node scripts/migrate.js",
     "test": "node --test",
-    "start": "node index.js"
+    "start": "node index.js",
+    "purge": "node scripts/purge.js"
   },
   "author": "",
   "license": "ISC",
   "description": "Durable shipment ingestion and delivery service for Order Desk",
   "private": true,
   "dependencies": {
-    "body-parser": "^1.20.3",
+    "@supabase/supabase-js": "^2.119.1",
+    "body-parser": "^1.20.9",
     "bottleneck": "^2.19.5",
-    "dotenv": "^16.4.5",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.6.1",
     "express": "^4.20.0",
+    "express-rate-limit": "^8.7.4",
+    "helmet": "^8.3.0",
     "node-fetch": "^3.3.2",
     "p-limit": "^6.2.0",
-    "pg": "^8.23.0"
+    "pg": "^8.23.1"
   }
 }

@@ -4,6 +4,8 @@ import { timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { QueueConflictError } from './queue.js';
 import { isUuid, validateShipments } from './validation.js';
+import { inboundRequestLogger } from './lib/requestLog.js';
+import { createAdmin } from './admin/index.js';
 
 const asyncHandler = (handler) => (req, res, next) => {
     Promise.resolve(handler(req, res, next)).catch(next);
@@ -32,9 +34,11 @@ const incomingApiKey = (req) => {
     return req.get('X-API-Key');
 };
 
-export const createApp = ({ queue, pool, worker }) => {
+export const createApp = ({ queue, pool, worker, admin = true }) => {
     const app = express();
     app.disable('x-powered-by');
+    // Heroku's router is the one proxy in front of the app; needed for req.ip.
+    app.set('trust proxy', 1);
 
     app.get('/health/live', (req, res) => {
         res.json({ status: 'ok' });
@@ -51,11 +55,23 @@ export const createApp = ({ queue, pool, worker }) => {
     app.get('/health', readinessHandler);
     app.get('/health/ready', readinessHandler);
 
+    // The request log dashboard has its own sign-in, so it sits outside the
+    // API key check and is not itself logged.
+    if (admin) app.use('/admin', createAdmin({ pool }));
+
+    app.use(inboundRequestLogger());
+
     app.use((req, res, next) => {
-        if (!config.inboundApiKey && !config.requireInboundAuth) return next();
-        if (!secureEqual(incomingApiKey(req), config.inboundApiKey)) {
+        if (!config.inboundApiKey && !config.requireInboundAuth) {
+            res.locals.inboundAuth = 'not_required';
+            return next();
+        }
+        const provided = incomingApiKey(req);
+        if (!secureEqual(provided, config.inboundApiKey)) {
+            res.locals.inboundAuth = provided ? 'invalid' : 'missing';
             return res.status(401).json({ message: 'Unauthorized' });
         }
+        res.locals.inboundAuth = 'ok';
         return next();
     });
 

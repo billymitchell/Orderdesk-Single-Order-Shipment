@@ -1,8 +1,15 @@
 import fetch from 'node-fetch';
 import Bottleneck from 'bottleneck';
 import { config, retryableHttpStatuses } from './config.js';
+import { currentLogContext, describeShipments, recordLog, redactHeaders, uniqueStrings } from './lib/requestLog.js';
 
 const storeLimiters = new Map();
+
+// Tests swap in a fake fetch; production always uses node-fetch.
+let fetchImpl = fetch;
+export const setFetchImplementation = (implementation) => {
+    fetchImpl = implementation || fetch;
+};
 
 const getStoreLimiter = (storeId) => {
     if (!storeLimiters.has(storeId)) {
@@ -53,10 +60,47 @@ export class OrderDeskError extends Error {
     }
 }
 
+// Saves one outbound row. Read the worker's log context before the limiter
+// queues the call: the context must come from this caller, not whichever job
+// Bottleneck happens to be running.
+const logOutbound = (logContext, { storeId, method, url, headers, body, started }, result) => {
+    const fromBody = body !== undefined ? describeShipments(body) : null;
+    const responseResults = Array.isArray(result.responseBody?.results) ? result.responseBody.results : null;
+    const failedResults = responseResults ? responseResults.filter((item) => item?.status !== 'success').length : 0;
+    let outcome = 'success';
+    if (result.networkError) outcome = 'network_error';
+    else if (result.status >= 400) outcome = 'downstream_error';
+    else if (failedResults > 0) outcome = 'partial_failure';
+
+    recordLog({
+        direction: 'outbound',
+        outcome,
+        method,
+        url,
+        status: result.status ?? null,
+        duration_ms: Date.now() - started,
+        request_headers: redactHeaders(headers),
+        request_body: body ?? null,
+        response_body: result.responseBody ?? null,
+        error_message: result.errorMessage
+            || (failedResults ? `${failedResults} of ${responseResults.length} shipments rejected` : null),
+        error_code: result.errorCode ?? null,
+        tokens_remaining: result.tokensRemaining,
+        store_ids: [storeId, ...(logContext?.storeIds || [])],
+        batch_ids: logContext?.batchIds || [],
+        job_ids: logContext?.jobIds || [],
+        tracking_numbers: uniqueStrings([...(fromBody?.trackingNumbers || []), ...(logContext?.trackingNumbers || [])]),
+        order_numbers: uniqueStrings([...(fromBody?.orderNumbers || []), ...(logContext?.orderNumbers || [])]),
+        shipment_count: Array.isArray(body) ? body.length : (body ? 1 : null)
+    });
+};
+
 const request = async ({ storeId, apiKey, url, method = 'GET', body, mutating = false }) => {
     const limiter = getStoreLimiter(storeId);
+    const logContext = currentLogContext();
 
     return limiter.schedule(async () => {
+        const started = Date.now();
         const headers = {
             'ORDERDESK-STORE-ID': storeId,
             'ORDERDESK-API-KEY': apiKey,
@@ -75,7 +119,7 @@ const request = async ({ storeId, apiKey, url, method = 'GET', body, mutating = 
         });
 
         try {
-            response = await fetch(url, {
+            response = await fetchImpl(url, {
                 method,
                 headers,
                 body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -83,6 +127,11 @@ const request = async ({ storeId, apiKey, url, method = 'GET', body, mutating = 
             });
         } catch (error) {
             const isTimeout = error.name === 'AbortError';
+            logOutbound(logContext, { storeId, method, url, headers, body, started }, {
+                networkError: true,
+                errorMessage: isTimeout ? `Timed out after ${config.orderDeskRequestTimeoutMs}ms` : error.message,
+                errorCode: isTimeout ? 'timeout' : 'network_error'
+            });
             throw new OrderDeskError(
                 isTimeout ? `Order Desk request timed out after ${config.orderDeskRequestTimeoutMs}ms` : error.message,
                 {
@@ -114,6 +163,13 @@ const request = async ({ storeId, apiKey, url, method = 'GET', body, mutating = 
         });
 
         const parsedTokens = Number.parseInt(tokensRemaining, 10);
+        logOutbound(logContext, { storeId, method, url, headers, body, started }, {
+            status: response.status,
+            responseBody,
+            tokensRemaining: parsedTokens,
+            errorMessage: response.ok ? null : (responseBody?.message || `Order Desk returned HTTP ${response.status}`),
+            errorCode: response.ok ? null : (response.status === 429 ? 'rate_limited' : `http_${response.status}`)
+        });
         if (Number.isFinite(parsedTokens)) {
             if (parsedTokens <= 0) {
                 console.error(`[RateLimit OVERAGE] store=${storeId} tokens=0 method=${method} url=${url}`);

@@ -8,6 +8,7 @@ import {
     fetchOrderId,
     findMatchingShipment
 } from './orderdesk.js';
+import { logContextForJobs, withLogContext } from './lib/requestLog.js';
 
 export const retryDelayMs = (attemptCount) => {
     const exponential = Math.min(300000, 1000 * (2 ** Math.max(1, attemptCount)));
@@ -99,21 +100,21 @@ export const createShipmentWorker = ({
         try {
             let orderId = job.order_id;
             if (!orderId) {
-                orderId = await services.fetchOrderId({
+                orderId = await withLogContext(logContextForJobs([job]), () => services.fetchOrderId({
                     storeId: job.store_id,
                     apiKey: store.API_KEY,
                     sourceId: job.source_id
-                });
+                }));
                 await queue.saveOrderId(job.id, settings.workerId, orderId);
             }
 
             if (job.last_error_code === 'uncertain') {
-                const existing = await services.findMatchingShipment({
+                const existing = await withLogContext(logContextForJobs([job]), () => services.findMatchingShipment({
                     storeId: job.store_id,
                     apiKey: store.API_KEY,
                     orderId,
                     payload: job.payload
-                });
+                }));
                 if (existing) {
                     await queue.markSucceeded(job.id, settings.workerId, {
                         reconciled: true,
@@ -132,7 +133,7 @@ export const createShipmentWorker = ({
 
     const processSingle = async ({ job, store, orderId }) => {
         try {
-            const response = await services.createSingleShipment({
+            const response = await withLogContext(logContextForJobs([job]), () => services.createSingleShipment({
                 storeId: job.store_id,
                 apiKey: store.API_KEY,
                 orderId,
@@ -140,7 +141,7 @@ export const createShipmentWorker = ({
                     ...shipmentFields(job.payload),
                     order_items: job.payload.order_items
                 }
-            });
+            }));
             await queue.markSucceeded(
                 job.id,
                 settings.workerId,
@@ -160,11 +161,14 @@ export const createShipmentWorker = ({
         }));
 
         try {
-            const response = await services.createBatchShipments({
-                storeId: first.job.store_id,
-                apiKey: first.store.API_KEY,
-                shipments: body
-            });
+            const response = await withLogContext(
+                logContextForJobs(preparedJobs.map(({ job }) => job)),
+                () => services.createBatchShipments({
+                    storeId: first.job.store_id,
+                    apiKey: first.store.API_KEY,
+                    shipments: body
+                })
+            );
             const results = Array.isArray(response?.results) ? response.results : [];
 
             await Promise.all(preparedJobs.map(async ({ job }, index) => {

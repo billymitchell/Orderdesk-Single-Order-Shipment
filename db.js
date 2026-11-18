@@ -28,4 +28,5 @@ export const assertDatabaseReady = async (pool) => {
     await pool.query('SELECT 1');
     await pool.query('SELECT 1 FROM shipment_batches LIMIT 1');
     await pool.query('SELECT 1 FROM shipment_jobs LIMIT 1');
+    await pool.query('SELECT 1 FROM request_logs LIMIT 1');
 };

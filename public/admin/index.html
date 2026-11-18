@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Order Desk Shipment Logs</title>
+<link rel="stylesheet" href="/admin/static/admin.css">
+<script src="/admin/static/dashboard.js" defer></script>
+</head>
+<body class="app">
+<header class="topbar">
+  <div class="brand">
+    <span class="eyebrow">Centricity</span>
+    <h1>Order Desk Shipment Logs</h1>
+  </div>
+  <div class="topbar-actions">
+    <span id="me" class="muted"></span>
+    <a id="export" class="button secondary" href="/admin/api/logs/export.csv">Export CSV</a>
+    <form method="post" action="/admin/logout">
+      <button type="submit" class="secondary">Sign out</button>
+    </form>
+  </div>
+</header>
+
+<main class="content">
+  <form id="filters" class="filters" autocomplete="off">
+    <label>From <input type="date" name="from"></label>
+    <label>To <input type="date" name="to"></label>
+    <label>Direction
+      <select name="direction">
+        <option value="">Both</option>
+        <option value="inbound">Inbound (to this API)</option>
+        <option value="outbound">Outbound (to Order Desk)</option>
+      </select>
+    </label>
+    <label>Outcome
+      <select name="outcome">
+        <option value="">Any</option>
+        <option value="success">Success</option>
+        <option value="partial_failure">Partly rejected</option>
+        <option value="validation_error">Validation error</option>
+        <option value="unauthorized">Unauthorized</option>
+        <option value="not_found">Not found</option>
+        <option value="conflict">Conflict</option>
+        <option value="error">Server error</option>
+        <option value="downstream_error">Order Desk error</option>
+        <option value="network_error">Network / timeout</option>
+      </select>
+    </label>
+    <label>Status
+      <select name="status">
+        <option value="">Any</option>
+        <option value="2xx">2xx</option>
+        <option value="4xx">4xx</option>
+        <option value="5xx">5xx</option>
+        <option value="202">202</option>
+        <option value="400">400</option>
+        <option value="401">401</option>
+        <option value="404">404</option>
+        <option value="409">409</option>
+        <option value="429">429</option>
+        <option value="503">503</option>
+      </select>
+    </label>
+    <label>Method
+      <select name="method">
+        <option value="">Any</option>
+        <option value="GET">GET</option>
+        <option value="POST">POST</option>
+      </select>
+    </label>
+    <label>Store
+      <select name="store"><option value="">Any</option></select>
+    </label>
+    <label>Inbound key
+      <select name="auth">
+        <option value="">Any</option>
+        <option value="ok">OK</option>
+        <option value="missing">Missing</option>
+        <option value="invalid">Invalid</option>
+        <option value="not_required">Not required</option>
+      </select>
+    </label>
+    <label>Batch ID
+      <input type="search" name="batch" placeholder="Batch UUID" spellcheck="false">
+    </label>
+    <label class="grow">Search
+      <input type="search" name="q" placeholder="Tracking #, source ID, order ID, batch, job or request ID, error">
+    </label>
+    <button type="button" id="reset" class="secondary">Reset</button>
+  </form>
+
+  <nav id="chips" class="chips" aria-label="Filter by outcome"></nav>
+
+  <div class="table-wrap">
+    <table id="logs">
+      <thead>
+        <tr>
+          <th data-sort="created_at" aria-sort="descending"><button type="button">Time</button></th>
+          <th data-sort="direction"><button type="button">Direction</button></th>
+          <th data-sort="outcome"><button type="button">Outcome</button></th>
+          <th>Request</th>
+          <th data-sort="status"><button type="button">Status</button></th>
+          <th data-sort="shipment_count" class="num"><button type="button">Shipments</button></th>
+          <th>Tracking #</th>
+          <th>Order #</th>
+          <th>Store</th>
+          <th data-sort="duration_ms" class="num"><button type="button">Time (ms)</button></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p id="empty" class="empty" hidden>No requests match these filters.</p>
+    <p id="error" class="notice notice-error" hidden></p>
+  </div>
+
+  <footer class="pager">
+    <span id="range" class="muted"></span>
+    <label class="muted">Rows
+      <select id="pageSize">
+        <option>25</option>
+        <option selected>50</option>
+        <option>100</option>
+        <option>200</option>
+      </select>
+    </label>
+    <button type="button" id="prev" class="secondary">Previous</button>
+    <button type="button" id="next" class="secondary">Next</button>
+  </footer>
+  <p id="retention" class="muted small"></p>
+</main>
+
+<aside id="drawer" class="drawer" hidden aria-labelledby="drawer-title" role="dialog">
+  <div class="drawer-head">
+    <div>
+      <h2 id="drawer-title">Request</h2>
+      <p id="drawer-sub" class="muted"></p>
+    </div>
+    <button type="button" id="drawer-close" class="secondary" aria-label="Close">Close</button>
+  </div>
+  <dl id="drawer-meta" class="meta"></dl>
+  <div class="tabs" role="tablist">
+    <button type="button" role="tab" data-tab="request" aria-selected="true">Request</button>
+    <button type="button" role="tab" data-tab="response" aria-selected="false">Response</button>
+    <button type="button" role="tab" data-tab="related" aria-selected="false">Related</button>
+  </div>
+  <div id="drawer-panel" class="panel" role="tabpanel"></div>
+</aside>
+<div id="scrim" class="scrim" hidden></div>
+</body>
+</html>

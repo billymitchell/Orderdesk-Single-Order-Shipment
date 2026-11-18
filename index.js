@@ -4,11 +4,15 @@ import { createPool, assertDatabaseReady, attachPoolErrorLogging } from './db.js
 import { ShipmentQueue } from './queue.js';
 import { createShipmentWorker } from './worker.js';
 import { createApp } from './app.js';
+import { configureRequestLog } from './lib/requestLog.js';
+import { schedulePurge } from './lib/retention.js';
 
 validateRuntimeConfig();
 const pool = createPool();
 attachPoolErrorLogging(pool);
 await assertDatabaseReady(pool);
+configureRequestLog({ pool });
+schedulePurge(pool);
 
 const queue = new ShipmentQueue(pool);
 const worker = createShipmentWorker({ queue });
